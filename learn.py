@@ -1,123 +1,166 @@
+import sys
 import cv2
-from ultralytics import YOLO
-import random
 import time
+from ultralytics import YOLO
 
-# Load a model
-model = YOLO('yolov8m.pt')  # load a pretrained model (recommended for training)
+import os
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
 
-# Train the model
-model.train(data='my_dataset_yolo/data.yaml', epochs=100, imgsz=640, model='yolov8m.pt')
+# ===================== CONFIG =====================
 
-def draw_bounding_boxes_without_id(frame, results, model):
-    """Рисует bounding boxes без ID (для детектора)"""
-    if len(results[0].boxes) == 0:
+DATA_YAML = "my_dataset_yolo/data.yaml"
+
+PRETRAINED_MODEL = "yolov8m.pt"
+TRAINED_MODEL = "runs/detect/train/weights/best.pt"
+
+VIDEO_PATH = "test.mp4"
+OUTPUT_PATH = "output_video.mp4"
+
+IMG_SIZE = 640
+EPOCHS = 100
+BATCH = 8        # CPU-safe
+
+CONF_THRES = 0.5
+IOU_THRES = 0.4
+
+SHOW_VIDEO = True
+SAVE_VIDEO = True
+
+# ===================== UTILS =====================
+
+def get_color(idx: int):
+    return (
+        int((idx * 37) % 255),
+        int((idx * 17) % 255),
+        int((idx * 29) % 255),
+    )
+
+def draw_boxes(frame, boxes, names):
+    if boxes is None:
         return frame
 
-    boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
-    classes = results[0].boxes.cls.cpu().numpy().astype(int)
+    xyxy = boxes.xyxy.cpu().numpy().astype(int)
+    cls = boxes.cls.cpu().numpy().astype(int)
+    ids = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
 
-    for box, clss in zip(boxes, classes):
-        if clss != 0:  # Фильтрация класса (например, игнорируем фон)
-            random.seed(int(clss) + 8)
-            color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+    for i, box in enumerate(xyxy):
+        class_id = cls[i]
+        track_id = ids[i] if ids is not None else -1
 
-            # Рисуем прямоугольник
-            cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
-            # Добавляем подпись класса
-            label = model.names[int(clss)]
-            cv2.putText(
-                frame,
-                label,
-                (box[0], box[1] - 10),  # Смещение над коробкой
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (50, 255, 50),
-                2,
-            )
+        color = get_color(track_id if track_id != -1 else class_id)
+
+        label = names[class_id]
+        if track_id != -1:
+            label += f" | ID {track_id}"
+
+        cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
+        cv2.putText(
+            frame,
+            label,
+            (box[0], box[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
     return frame
 
-def process_video_with_tracking(model, model_detect, input_video_path, show_video=True, save_video=False, output_video_path="output_video.mp4"):
-    cap = cv2.VideoCapture(input_video_path)
-    if not cap.isOpened():
-        raise Exception("Error: Could not open video file.")
+# ===================== TRAIN =====================
 
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+def train():
+    print("🚀 Training started (CPU)")
 
-    # Настройка записи видео
-    out = None
-    if save_video:
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
+    model = YOLO(PRETRAINED_MODEL)
 
-    frame_count = 0
-    last_frame_time = time.time()
+    model.train(
+        data=DATA_YAML,
+        epochs=EPOCHS,
+        imgsz=IMG_SIZE,
+        batch=BATCH,
+        device="cpu",
+        workers=4,
+        project="runs/detect",
+        name="train",
+        exist_ok=True,
+    )
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            frame_count += 1
+    print("✅ Training finished")
 
-            # Проверка на конец видео или таймаут
-            if not ret or frame is None or frame.size == 0:
-                if time.time() - last_frame_time > 5:
-                    print("Video ended or timeout")
-                    break
-                continue
-            last_frame_time = time.time()
+# ===================== INFERENCE + TRACKING =====================
 
-            # Обработка трекера (с ID)
-            results_track = model.track(frame, iou=0.4, conf=0.5, persist=True, imgsz=640)
-            if results_track[0].boxes.id is not None:
-                boxes = results_track[0].boxes.xyxy.cpu().numpy().astype(int)
-                ids = results_track[0].boxes.id.cpu().numpy().astype(int)
-                for box, id in zip(boxes, ids):
-                    random.seed(int(id))
-                    color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
-                    cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
-                    cv2.putText(frame, f"Id {id}", (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+def infer():
+    model = YOLO("yolo11n.pt")
+    cap = cv2.VideoCapture(VIDEO_PATH)
 
-            # Обработка детектора (без ID, только классы)
-            results_detect = model_detect(frame, iou=0.4, conf=0.5, imgsz=640)
-            frame = draw_bounding_boxes_without_id(frame, results_detect, model_detect)
+    prev_time = time.time()
 
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-            # Сохранение кадра
-            if save_video and out is not None:
-                out.write(frame)
+        results = model.track(
+            frame,
+            persist=True,
+            imgsz=IMG_SIZE,
+            conf=CONF_THRES,
+            iou=IOU_THRES,
+            tracker="botsort.yaml"
+        )
 
+        # Получаем результаты
+        result = results[0]
 
-            # Отображение в реальном времени
-            if show_video:
-                resized_frame = cv2.resize(frame, None, fx=0.75, fy=0.75)
-                cv2.imshow("Processed Video", resized_frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+        # Работа с боксами
+        if result.boxes is not None:
+            boxes = result.boxes.xyxy.cpu().numpy()  # координаты
+            confidences = result.boxes.conf.cpu().numpy()  # уверенность
+            class_ids = result.boxes.cls.cpu().numpy().astype(int)  # классы
 
-    except Exception as e:
-        print(f"Error during processing: {e}")
-    finally:
-        cap.release()
-        if out is not None:
-            out.release()
-        cv2.destroyAllWindows()
+            # Отрисовка
+            for box, conf, cls_id in zip(boxes, confidences, class_ids):
+                if conf > 0.5:  # дополнительный фильтр
+                    x1, y1, x2, y2 = map(int, box)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-    return results_track, results_detect
+                    # Метка с именем класса и уверенностью
+                    label = f"{model.names[cls_id]} {conf:.2f}"
+                    cv2.putText(frame, label, (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-# Пример использования
-model = YOLO('runs/detect/train/weights/best.pt')
-model_detect = YOLO('runs/detect/train/weights/best.pt')
+        # Расчет FPS
+        curr_time = time.time()
+        fps = 1 / (curr_time - prev_time)
+        prev_time = curr_time
 
-model.fuse()
-model_detect.fuse()
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-results_track, results_detect = process_video_with_tracking(
-    model=model,
-    model_detect=model_detect,
-    input_video_path="test.mp4",
-    show_video=True,
-    save_video=True,
-    output_video_path="output_video.mp4"
-)
+        cv2.imshow("Detection", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# ===================== ENTRY =====================
+
+def main():
+    #if len(sys.argv) < 2:
+    #    print("Usage: python learn.py [train|infer]")
+    #    return
+
+    #mode = sys.argv[1]
+
+    #if mode == "train":
+    #train()
+    #elif mode == "infer":
+    infer()
+    #else:
+    #    print("Unknown mode:", mode)
+
+if __name__ == "__main__":
+    main()
